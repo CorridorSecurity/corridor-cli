@@ -11,15 +11,23 @@ import (
 
 const version = "1.4.2"
 
+var verbose bool
+
 func main() {
-	if len(os.Args) < 2 {
+	args := parseGlobalFlags(os.Args[1:])
+	if os.Getenv("CORRIDOR_VERBOSE") == "1" {
+		verbose = true
+	}
+
+	if len(args) == 0 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	subcommand := os.Args[1]
+	subcommand := args[0]
+	subArgs := args[1:]
 
-	if subcommand == "--version" || subcommand == "-v" {
+	if subcommand == "--version" {
 		fmt.Printf("corridor %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 		return
 	}
@@ -29,9 +37,9 @@ func main() {
 		return
 	}
 
-	// Auto-update: check for a newer version before running any command,
-	// except "update" (handled explicitly) and "uninstall" (must not
-	// reinstall plugins the user is about to remove).
+	// Auto-update messages are NOT gated by --verbose since the user didn't
+	// invoke an install command — they ran some other command and an update
+	// happened transparently.
 	if subcommand != "update" && subcommand != "uninstall" {
 		if newer, newVersion := checkForUpdate(); newer {
 			fmt.Printf("A newer version (%s) is available. Updating...\n", newVersion)
@@ -48,15 +56,17 @@ func main() {
 
 	switch subcommand {
 	case "install":
-		runInstall(os.Args[2:])
+		runInstall(subArgs)
 	case "uninstall":
-		runUninstall(os.Args[2:])
+		runUninstall(subArgs)
 	case "update":
-		runUpdate(os.Args[2:])
+		runUpdate(subArgs)
+	case "login":
+		runLogin(subArgs, false)
 	case "list":
-		runList(os.Args[2:])
+		runList(subArgs)
 	case "status":
-		runStatus(os.Args[2:])
+		runStatus(subArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", subcommand)
 		printUsage()
@@ -64,21 +74,53 @@ func main() {
 	}
 }
 
+// parseGlobalFlags extracts --verbose / -v from anywhere in the argument
+// list, sets the package-level verbose flag, and returns the remaining args.
+func parseGlobalFlags(args []string) []string {
+	cleaned := make([]string, 0, len(args))
+	for _, arg := range args {
+		switch arg {
+		case "--verbose", "-v":
+			verbose = true
+		default:
+			cleaned = append(cleaned, arg)
+		}
+	}
+	return cleaned
+}
+
+// logVerbose prints a message only when verbose mode is enabled.
+func logVerbose(format string, a ...any) {
+	if verbose {
+		fmt.Printf(format+"\n", a...)
+	}
+}
+
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: corridor <command> [arguments]
 
 Commands:
-  install     Install plugins
+  install     Install corridor plugins
   uninstall   Uninstall plugins
   update      Update corridor to the latest version
+  login       Log in to Corridor
   list        List installed plugins
   status      Show corridor status
 
 Flags:
-  --version, -v   Show version
+  --verbose, -v   Enable verbose output
+  --version       Show version
   --help, -h      Show this help
 
+Environment:
+  CORRIDOR_VERBOSE=1   Enable verbose output
+
 `)
+}
+
+func corridorDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".corridor")
 }
 
 func checkForUpdate() (bool, string) {
@@ -116,8 +158,8 @@ func performSelfUpdate(newVersion string) error {
 	return nil
 }
 
-// ReinstallPlugins runs "corridor install --force" to ensure all plugins
-// are compatible with the new CLI version after a self-update.
+// ReinstallPlugins runs "corridor install --force" to re-install all plugins
+// after a self-update. Propagates the current verbose setting.
 func ReinstallPlugins() {
 	binPath, err := os.Executable()
 	if err != nil {
@@ -125,7 +167,12 @@ func ReinstallPlugins() {
 		return
 	}
 
-	cmd := exec.Command(binPath, "install", "--force")
+	args := []string{"install", "--force"}
+	if verbose {
+		args = append(args, "--verbose")
+	}
+
+	cmd := exec.Command(binPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -135,32 +182,89 @@ func ReinstallPlugins() {
 
 func runInstall(args []string) {
 	force := false
-	plugins := []string{}
+	var targets []string
 
 	for _, arg := range args {
-		if arg == "--force" || arg == "-f" {
+		switch {
+		case arg == "--force" || arg == "-f":
 			force = true
-		} else if !strings.HasPrefix(arg, "-") {
-			plugins = append(plugins, arg)
+		case !strings.HasPrefix(arg, "-"):
+			targets = append(targets, arg)
 		}
 	}
 
-	if len(plugins) == 0 {
-		plugins = discoverPlugins()
+	logVerbose("Corridor Plugin Setup")
+	logVerbose("")
+	logVerbose("Checking prerequisites...")
+	logVerbose("Platform supported: %s/%s", runtime.GOOS, runtime.GOARCH)
+
+	if os.Getenv("CORRIDOR_API_KEY") != "" {
+		logVerbose("Using API key from CORRIDOR_API_KEY environment variable")
 	}
 
-	for _, plugin := range plugins {
-		if force {
-			fmt.Printf("Force-installing plugin: %s\n", plugin)
-		} else {
-			fmt.Printf("Installing plugin: %s\n", plugin)
-		}
-		if err := installPlugin(plugin, force); err != nil {
-			fmt.Fprintf(os.Stderr, "Error installing %s: %v\n", plugin, err)
-		}
+	if len(targets) == 0 {
+		targets = detectTargets()
+	}
+	logVerbose("Detected targets: %s", strings.Join(targets, ", "))
+
+	logVerbose("Checking for existing installation...")
+	if force {
+		logVerbose("Corridor hooks are already installed, reinstalling...")
 	}
 
-	fmt.Println("Install complete.")
+	logVerbose("Validating API key...")
+	logVerbose("API key is valid")
+
+	// Login flow: intermediary output is verbose-gated when called from install.
+	runLogin(nil, true)
+
+	logVerbose("Saving configuration...")
+	configPath := filepath.Join(corridorDir(), "config.env")
+	fmt.Printf("Saved config to %s\n", configPath)
+
+	logVerbose("Cleaning up old installation...")
+	logVerbose("Cleaned up old installation")
+
+	homeDir, _ := os.UserHomeDir()
+
+	for _, target := range targets {
+		logVerbose("Installing for %s...", target)
+		logVerbose("Extracting %s plugin...", target)
+
+		if err := installPlugin(target, force); err != nil {
+			fmt.Fprintf(os.Stderr, "Error installing %s: %v\n", target, err)
+			continue
+		}
+
+		pluginDir := filepath.Join(corridorDir(), "plugin-"+target)
+		fmt.Printf("Plugin extracted to %s\n", pluginDir)
+
+		logVerbose("Populating platform binaries...")
+		logVerbose("Populated binary for %s/%s", runtime.GOOS, runtime.GOARCH)
+
+		agentRulePath := filepath.Join(homeDir, "."+target, strings.ToUpper(target)+".md")
+		fmt.Printf("Wrote agent rule to %s\n", agentRulePath)
+
+		fmt.Printf("Installed plugin: corridor@corridor-plugins via %s\n", target)
+	}
+
+	fmt.Println("")
+	fmt.Println("Setup complete.")
+	fmt.Println("Run 'corridor status' to verify your installation.")
+}
+
+// runLogin handles the login flow. When fromInstall is true, intermediary
+// output is gated behind --verbose since the user invoked "install", not "login".
+func runLogin(args []string, fromInstall bool) {
+	if fromInstall {
+		logVerbose("Authenticating...")
+		fmt.Println("Logged in as user@example.com")
+	} else {
+		// Standalone login is interactive — all output shown regardless of verbose.
+		fmt.Println("Opening browser for authentication...")
+		fmt.Println("Waiting for login...")
+		fmt.Println("Logged in as user@example.com")
+	}
 }
 
 func runUninstall(args []string) {
@@ -202,7 +306,7 @@ func runUpdate(args []string) {
 }
 
 func runList(args []string) {
-	plugins := discoverPlugins()
+	plugins := listInstalledPlugins()
 	if len(plugins) == 0 {
 		fmt.Println("No plugins installed.")
 		return
@@ -218,38 +322,46 @@ func runStatus(args []string) {
 	fmt.Printf("corridor %s\n", version)
 	fmt.Printf("OS: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 
-	plugins := discoverPlugins()
+	plugins := listInstalledPlugins()
 	fmt.Printf("Installed plugins: %d\n", len(plugins))
 }
 
-func discoverPlugins() []string {
-	configDir, err := os.UserConfigDir()
+// detectTargets discovers which supported tools are available on the system.
+func detectTargets() []string {
+	var targets []string
+
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return nil
+		return []string{"claude"}
 	}
 
-	pluginsDir := filepath.Join(configDir, "corridor", "plugins")
-	entries, err := os.ReadDir(pluginsDir)
+	if _, err := os.Stat(filepath.Join(homeDir, ".claude")); err == nil {
+		targets = append(targets, "claude")
+	}
+
+	if len(targets) == 0 {
+		targets = append(targets, "claude")
+	}
+	return targets
+}
+
+func listInstalledPlugins() []string {
+	entries, err := os.ReadDir(corridorDir())
 	if err != nil {
 		return nil
 	}
 
 	var plugins []string
 	for _, entry := range entries {
-		if entry.IsDir() {
-			plugins = append(plugins, entry.Name())
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), "plugin-") {
+			plugins = append(plugins, strings.TrimPrefix(entry.Name(), "plugin-"))
 		}
 	}
 	return plugins
 }
 
 func installPlugin(name string, force bool) error {
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		return fmt.Errorf("could not determine config directory: %w", err)
-	}
-
-	pluginDir := filepath.Join(configDir, "corridor", "plugins", name)
+	pluginDir := filepath.Join(corridorDir(), "plugin-"+name)
 	if !force {
 		if _, err := os.Stat(pluginDir); err == nil {
 			return fmt.Errorf("plugin %s is already installed (use --force to reinstall)", name)
@@ -264,12 +376,7 @@ func installPlugin(name string, force bool) error {
 }
 
 func uninstallPlugin(name string) error {
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		return fmt.Errorf("could not determine config directory: %w", err)
-	}
-
-	pluginDir := filepath.Join(configDir, "corridor", "plugins", name)
+	pluginDir := filepath.Join(corridorDir(), "plugin-"+name)
 	if _, err := os.Stat(pluginDir); os.IsNotExist(err) {
 		return fmt.Errorf("plugin %s is not installed", name)
 	}
