@@ -66,7 +66,10 @@ fi
 log_verbose "Verifying checksum..."
 CHECKSUM_URL="https://releases.corridor.dev/cli/${VERSION}/checksums.txt"
 if curl -fsSL "$CHECKSUM_URL" -o "${TMP_DIR}/checksums.txt" 2>/dev/null; then
-    (cd "$TMP_DIR" && grep "$FILENAME" checksums.txt | sha256sum -c --quiet 2>/dev/null) || true
+    if ! (cd "$TMP_DIR" && grep "$FILENAME" checksums.txt | sha256sum -c --quiet); then
+        log_error "Checksum verification failed"
+        exit 1
+    fi
     log_verbose "Checksum verified."
 fi
 
