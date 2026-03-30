@@ -48,6 +48,8 @@ func main() {
 			} else {
 				fmt.Println("Update complete. Reinstalling plugins...")
 				ReinstallPlugins()
+				fmt.Println()
+				fmt.Println(UpdateBrief(newVersion))
 				fmt.Println("Please re-run your command.")
 				os.Exit(0)
 			}
@@ -67,6 +69,8 @@ func main() {
 		runList(subArgs)
 	case "status":
 		runStatus(subArgs)
+	case "changelog":
+		runChangelog(subArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", subcommand)
 		printUsage()
@@ -106,6 +110,7 @@ Commands:
   login       Log in to Corridor
   list        List installed plugins
   status      Show corridor status
+  changelog   Show changelog (use --brief for summary)
 
 Flags:
   --verbose, -v   Enable verbose output
@@ -302,7 +307,8 @@ func runUpdate(args []string) {
 
 	fmt.Println("Update complete. Reinstalling plugins for compatibility...")
 	ReinstallPlugins()
-	fmt.Println("Done.")
+	fmt.Println()
+	fmt.Println(UpdateBrief(newVersion))
 }
 
 func runList(args []string) {
